@@ -1,30 +1,35 @@
 #!/bin/bash
 
 set -e
-DATA_ROOT="/workspace/geuvadis_check/output"
-WORKDIR="/workspace/final_robust_training"
+WORKDIR="/workspace/final_genome_training"
 mkdir -p "$WORKDIR"
 cd "$WORKDIR"
 
+# 1. SETUP ENVIRONMENT
 CONDA_BASE=$(conda info --base)
-ENV_PATH="$CONDA_BASE/envs/enformer_stable"
-PYTHON_EXEC="$ENV_PATH/bin/python"
+PYTHON_EXEC="$CONDA_BASE/envs/enformer_stable/bin/python"
 
-echo ">>> [FIX] Pre-downloading Enformer weights to local folder..."
+# 2. DOWNLOAD WEIGHTS (Restored & Essential)
+echo ">>> Checking Model Weights..."
 mkdir -p enformer_weights
-cd enformer_weights
-
-if [ ! -f "config.json" ]; then
-    wget -q -nc https://huggingface.co/EleutherAI/enformer-official-rough/resolve/main/config.json
+if [ ! -f "enformer_weights/config.json" ]; then
+    echo "   Downloading config.json..."
+    wget -q -nc -O enformer_weights/config.json https://huggingface.co/EleutherAI/enformer-official-rough/resolve/main/config.json
+fi
+if [ ! -f "enformer_weights/pytorch_model.bin" ]; then
+    echo "   Downloading pytorch_model.bin (1.2GB)..."
+    wget -q -nc -O enformer_weights/pytorch_model.bin https://huggingface.co/EleutherAI/enformer-official-rough/resolve/main/pytorch_model.bin
 fi
 
-if [ ! -f "pytorch_model.bin" ]; then
-    wget -q -nc https://huggingface.co/EleutherAI/enformer-official-rough/resolve/main/pytorch_model.bin
+# 3. DOWNLOAD GTF
+if [ ! -f "gencode.v44.annotation.gtf" ]; then
+    echo ">>> Fetching Whole Genome GTF..."
+    wget -q -nc https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_44/gencode.v44.annotation.gtf.gz
+    gunzip -f gencode.v44.annotation.gtf.gz
 fi
 
-cd "$WORKDIR"
-echo ">>> Weights downloaded successfully."
-cat << 'EOF' > train_paper_robust.py
+# 4. GENERATE TRAINING SCRIPT
+cat << 'EOF' > train_compliance_final.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -38,40 +43,63 @@ from sklearn.model_selection import KFold, train_test_split
 import os
 import glob
 import random
+import re
 import sys
 
-SEQ_LENGTH = 196_608 
-BATCH_SIZE = 1 
-LEARNING_RATE = 5e-5      
-MAX_EPOCHS = 10           
+# --- GLOBAL CONFIGURATION ---
+# Model A: 49,152 bp input -> 384 output bins (128bp/bin)
+# This `target_length` ensures the model doesn't try to crop 49kb into 896 bins (which would crash).
+SEQ_LEN_A = 49_152
+TARGET_LEN_A = 384  
+# Model B: 196,608 bp input -> 896 output bins (Standard Enformer behavior)
+SEQ_LEN_B = 196_608
+TARGET_LEN_B = 896  
+
+ACCUMULATION_STEPS = 32 # Simulates Batch Size 32
+MAX_EPOCHS = 10
 PAIRS_PER_EPOCH = 20000 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-DATA_ROOT = "/workspace/geuvadis_check/output"
-GTF_PATH = "gencode.v44.annotation.gtf"
-SAVE_DIR = "checkpoints"
-PRETRAINED_PATH = "./enformer_weights" 
-
+# --- PATHS ---
+DATA_ROOT = "/workspace/geuvadis_full/output"
+GTF_PATH = "gencode.v44.annotation.gtf" 
+PRETRAINED_PATH = "./enformer_weights"
+SAVE_DIR = "checkpoints_compliance"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-print(f">>> FINAL EXPERIMENT INIT | Device: {DEVICE}")
+print(f">>> OFFICIAL ARCHITECTURE REPLICATION | Device: {DEVICE}")
 
+# --- 1. DATA MANAGER ---
 class DataManager:
     def __init__(self, root_dir, gtf_path):
         print(">>> Loading Data Manager...")
         self.base_map = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
-        
         self.samples = {} 
-        fasta_files = glob.glob(os.path.join(root_dir, "*_chr22_personalized.fa"))
+        
+        # Scan Files
+        fasta_files = glob.glob(os.path.join(root_dir, "**", "*_personalized.fa"), recursive=True)
+        quant_files = glob.glob(os.path.join(root_dir, "**", "quant.sf"), recursive=True)
+        
+        quant_map = {}
+        for q in quant_files:
+            parent = os.path.basename(os.path.dirname(q))
+            sid_match = re.search(r'(HG\d+|NA\d+)', parent)
+            if sid_match: quant_map[sid_match.group(1)] = q
+        
         for f in fasta_files:
-            sid = os.path.basename(f).split('_')[0]
-            qpath = os.path.join(root_dir, f"{sid}_quant", "quant.sf")
-            if os.path.exists(qpath):
-                self.samples[sid] = {'fasta': f, 'quant': qpath}
-        self.sample_ids = list(self.samples.keys())
-        print(f"   Samples: {len(self.sample_ids)}")
+            fname = os.path.basename(f)
+            match = re.search(r'(HG\d+|NA\d+)_(chr[\dXYM]+|[\dXYM]+)', fname)
+            if match:
+                sid, chrom = match.groups()
+                if not chrom.startswith('chr'): chrom = 'chr' + chrom
+                if sid in quant_map:
+                    if sid not in self.samples: self.samples[sid] = {'quant': quant_map[sid]}
+                    self.samples[sid][chrom] = f
 
-        print("   Caching Expression...")
+        self.sample_ids = list(self.samples.keys())
+        print(f"   Indexed {len(self.sample_ids)} valid samples.")
+
+        print("   Caching Expression Data...")
         self.raw_cache = {}
         for sid in self.sample_ids:
              try:
@@ -79,7 +107,7 @@ class DataManager:
                 self.raw_cache[sid] = dict(zip(df['Name'], df['TPM']))
              except: pass
 
-        print("   Parsing Genes & Calculating Stats...")
+        print("   Parsing GTF...")
         self.genes = []
         self.z_stats = {}
         
@@ -88,221 +116,269 @@ class DataManager:
             for line in f:
                 if line.startswith("#"): continue
                 parts = line.split('\t')
-                if parts[0] not in ['22', 'chr22']: continue
                 if parts[2] == 'transcript':
                     try:
+                        chrom = parts[0]
+                        if not chrom.startswith('chr'): chrom = 'chr' + chrom
+                        if '_' in chrom: continue 
                         tid = [x for x in parts[8].split(';') if 'transcript_id' in x][0].split('"')[1]
                         start, end = int(parts[3]), int(parts[4])
                         tss = start if parts[6] == '+' else end
-                        all_transcripts.append({'id': tid, 'tss': tss})
+                        all_transcripts.append({'id': tid, 'tss': tss, 'chrom': chrom})
                     except: continue
         
-        sample_subset = self.sample_ids[:50]
-        for g in all_transcripts:
+        unique_transcripts = []
+        seen_tss = set()
+        for t in all_transcripts:
+            key = (t['chrom'], t['tss'])
+            if key not in seen_tss:
+                unique_transcripts.append(t)
+                seen_tss.add(key)
+        
+        print("   Calculating Whole-Population Z-Scores...")
+        for g in unique_transcripts:
             vals = []
-            for sid in sample_subset:
+            # Use ALL SAMPLES to avoid "Subset Trap"
+            for sid in self.sample_ids:
                 if sid in self.raw_cache and g['id'] in self.raw_cache[sid]:
                     vals.append(self.raw_cache[sid][g['id']])
             
-            if len(vals) > 5: 
+            if len(vals) > 50: 
                 vals = np.log1p(np.array(vals))
+                std = np.std(vals)
+                if std < 1e-4: continue # Filter Zero-Variance
                 mean = np.mean(vals)
-                std = np.std(vals) + 1e-6
                 self.z_stats[g['id']] = {'mean': mean, 'std': std}
                 self.genes.append(g)
                 
-        print(f"   Valid Genes: {len(self.genes)}")
+        print(f"   Final Valid Genes: {len(self.genes)}")
 
-    def get_dataset(self, gene_indices, is_train=True):
-        genes_subset = [self.genes[i] for i in gene_indices]
-        return RobustDataset(self, genes_subset, is_train)
+    def get_dataset(self, indices, is_train, seq_len):
+        return RobustDataset(self, [self.genes[i] for i in indices], is_train, seq_len)
 
 class RobustDataset(Dataset):
-    def __init__(self, manager, genes, is_train):
+    def __init__(self, manager, genes, is_train, seq_len):
         self.manager = manager
         self.genes = genes
         self.is_train = is_train
+        self.seq_len = seq_len
         self.generate_epoch_pairs()
-        
+
     def generate_epoch_pairs(self):
         self.pairs = []
-        count = PAIRS_PER_EPOCH if self.is_train else PAIRS_PER_EPOCH // 5
+        target = PAIRS_PER_EPOCH if self.is_train else PAIRS_PER_EPOCH // 5
         attempts = 0
-        while len(self.pairs) < count and attempts < count * 5:
+        while len(self.pairs) < target and attempts < target * 5:
             attempts += 1
             g = random.choice(self.genes)
             s1, s2 = random.sample(self.manager.sample_ids, 2)
+            chrom = g['chrom']
             
-            if g['id'] in self.manager.raw_cache.get(s1, {}) and g['id'] in self.manager.raw_cache.get(s2, {}):
-                raw1 = np.log1p(self.manager.raw_cache[s1][g['id']])
-                raw2 = np.log1p(self.manager.raw_cache[s2][g['id']])
-                stats = self.manager.z_stats[g['id']]
-                z1 = (raw1 - stats['mean']) / stats['std']
-                z2 = (raw2 - stats['mean']) / stats['std']
-                self.pairs.append({'tss': g['tss'], 's1': s1, 's2': s2, 'z_diff': z1 - z2})
+            if chrom in self.manager.samples[s1] and chrom in self.manager.samples[s2]:
+                if g['id'] in self.manager.raw_cache[s1] and g['id'] in self.manager.raw_cache[s2]:
+                    raw1 = np.log1p(self.manager.raw_cache[s1][g['id']])
+                    raw2 = np.log1p(self.manager.raw_cache[s2][g['id']])
+                    stats = self.manager.z_stats[g['id']]
+                    
+                    z1 = (raw1 - stats['mean']) / stats['std']
+                    z2 = (raw2 - stats['mean']) / stats['std']
+                    
+                    if abs(z1 - z2) > 20: continue 
+                    
+                    self.pairs.append({
+                        'tss': g['tss'], 'chrom': chrom, 's1': s1, 's2': s2,
+                        'z_diff': z1 - z2
+                    })
 
     def __len__(self): return len(self.pairs)
 
-    def load_seq(self, fasta_path, tss):
-        extractor = kipoiseq.extractors.FastaStringExtractor(fasta_path)
-        chrom = list(extractor.fasta.keys())[0]
+    def load_seq(self, sid, chrom, tss):
+        extractor = kipoiseq.extractors.FastaStringExtractor(self.manager.samples[sid][chrom])
+        f_chrom = list(extractor.fasta.keys())[0]
         
-        shift = random.randint(-2, 2) if self.is_train else 0
+        shift = random.randint(-3, 3) if self.is_train else 0
         center = tss + shift
-        interval = Interval(chrom, center - SEQ_LENGTH // 2, center + SEQ_LENGTH // 2)
-        try: seq = extractor.extract(interval)
-        except: seq = "N" * SEQ_LENGTH
+        interval = Interval(f_chrom, center - self.seq_len // 2, center + self.seq_len // 2)
         
-        if len(seq) < SEQ_LENGTH: seq += "N" * (SEQ_LENGTH - len(seq))
-        elif len(seq) > SEQ_LENGTH: seq = seq[:SEQ_LENGTH]
+        try: seq = extractor.extract(interval)
+        except: seq = "N" * self.seq_len
+        
+        if len(seq) < self.seq_len: seq += "N" * (self.seq_len - len(seq))
+        elif len(seq) > self.seq_len: seq = seq[:self.seq_len]
         
         if self.is_train and random.random() > 0.5:
-            trans = str.maketrans("ACGTNacgtn", "TGCANtgcan")
-            seq = seq.translate(trans)[::-1]
+            seq = seq.translate(str.maketrans("ACGTNacgtn", "TGCANtgcan"))[::-1]
             
         arr = np.zeros((len(seq), 4), dtype=np.float32)
         for i, char in enumerate(seq.upper()):
-            if char in self.manager.base_map: 
-                arr[i, self.manager.base_map[char]] = 1.0
+            if char in self.manager.base_map: arr[i, self.manager.base_map[char]] = 1.0
         return arr
 
     def __getitem__(self, idx):
         p = self.pairs[idx]
-        x1 = self.load_seq(self.manager.samples[p['s1']]['fasta'], p['tss'])
-        x2 = self.load_seq(self.manager.samples[p['s2']]['fasta'], p['tss'])
-        return (torch.tensor(x1, dtype=torch.float32), 
-                torch.tensor(x2, dtype=torch.float32), 
-                torch.tensor([p['z_diff']], dtype=torch.float32))
+        x1 = self.load_seq(p['s1'], p['chrom'], p['tss'])
+        x2 = self.load_seq(p['s2'], p['chrom'], p['tss'])
+        return torch.tensor(x1), torch.tensor(x2), torch.tensor([p['z_diff']], dtype=torch.float32)
+
+# --- 2. MODELS ---
 
 class SwiGLU(nn.Module):
     def forward(self, x):
         x, gate = x.chunk(2, dim=-1)
         return F.silu(gate) * x
 
-class EnformerRobust(nn.Module):
+class EnformerWrapper(nn.Module):
     def __init__(self, mode="Original"):
         super().__init__()
-        self.backbone = Enformer.from_pretrained(PRETRAINED_PATH)
-        for param in self.backbone.parameters(): param.requires_grad = False
-        for param in self.backbone.transformer[-1:].parameters(): param.requires_grad = True
+        self.mode = mode
+        dim = 5313
         
-        dim = 5313 
+        # --- CLEAN ARCHITECTURE CONFIGURATION ---
+        if mode == "Original":
+            # Model A: 49kb input -> 384 bins
+            target_len = TARGET_LEN_A
+        else:
+            # Model B: 196kb input -> 896 bins
+            target_len = TARGET_LEN_B
+            
+        # Load with explicit target_length (The Clean Fix)
+        # use_checkpointing=True allows training 1.2B params on 1 GPU
+        self.backbone = Enformer.from_pretrained(
+            PRETRAINED_PATH, 
+            use_checkpointing=True, 
+            target_length=target_len
+        )
         
-        if mode == "SwiGLU":
+        # UNFREEZE ALL (Paper Compliance)
+        for param in self.backbone.parameters(): param.requires_grad = True
+        
+        if mode == "Original":
+            # [MODEL A]: Paper Head (GELU, No Norm)
+            self.attn_pool = nn.Linear(dim, 1)
+            self.final = nn.Linear(dim, 1)
+            
+        elif mode == "SwiGLU":
+            # [MODEL B]: Enhanced Head (SwiGLU, LayerNorm, Dropout)
             self.norm = nn.LayerNorm(dim)
             self.project = nn.Linear(dim, dim * 2)
             self.activation = SwiGLU()
-        else: # Original
-            self.norm = nn.Identity()
-            self.project = nn.Linear(dim, dim)
-            self.activation = nn.GELU()
-            
-        self.attn_pool = nn.Linear(dim, 1)
-        self.final = nn.Linear(dim, 1)
+            self.dropout = nn.Dropout(0.1) 
+            self.attn_pool = nn.Linear(dim, 1)
+            self.final = nn.Linear(dim, 1)
 
     def forward_single(self, x):
-        out = self.backbone(x)['human']
-        mid = out.shape[1] // 2
-        out = out[:, mid-2:mid+2, :] 
-        out = self.norm(out)
-        out = self.activation(self.project(out))
-        weights = F.softmax(self.attn_pool(out), dim=1)
-        pooled = (out * weights).sum(dim=1)
-        return self.final(pooled)
+        out = self.backbone(x)['human'] 
+        
+        if self.mode == "Original":
+            # MODEL A: Central 10 Bins (Indices 187-197 for 384 bins)
+            n_bins = out.shape[1]
+            center = n_bins // 2
+            out = out[:, center-5:center+5, :]
+            
+            w = F.softmax(self.attn_pool(out), dim=1)
+            pooled = (out * w).sum(dim=1)
+            return self.final(pooled)
+            
+        elif self.mode == "SwiGLU":
+            # MODEL B: Center 4 Bins
+            mid = out.shape[1] // 2
+            out = out[:, mid-2:mid+2, :] 
+            
+            out = self.norm(out)
+            out = self.dropout(self.activation(self.project(out)))
+            w = F.softmax(self.attn_pool(out), dim=1)
+            pooled = (out * w).sum(dim=1)
+            return self.final(pooled)
 
     def forward(self, x1, x2):
         return self.forward_single(x1) - self.forward_single(x2)
 
-def train_cycle(model, train_dl, val_dl, epochs=5):
-    opt = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-    crit = nn.HuberLoss(delta=1.0)
-    
-    best_val = float('inf')
+# --- TRAINING ENGINE ---
+def train_cycle(model, train_dl, val_dl, epochs, model_type):
+    if model_type == "Original":
+        lr, wd, crit = 1e-4, 1e-3, nn.MSELoss()
+    else:
+        lr, wd, crit = 2e-5, 1e-2, nn.HuberLoss(delta=1.0)
+        
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    best_v = float('inf')
     
     for ep in range(epochs):
         model.train()
         losses = []
-        for x1, x2, target in train_dl:
-            x1, x2, target = x1.to(DEVICE), x2.to(DEVICE), target.to(DEVICE)
-            opt.zero_grad()
+        opt.zero_grad() 
+        for i, (x1, x2, y) in enumerate(train_dl):
+            x1, x2, y = x1.to(DEVICE), x2.to(DEVICE), y.to(DEVICE)
             pred = model(x1, x2)
-            loss = crit(pred, target)
+            loss = crit(pred, y)
+            loss = loss / ACCUMULATION_STEPS
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5) 
-            opt.step()
-            losses.append(loss.item())
+            
+            if (i + 1) % ACCUMULATION_STEPS == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                opt.step()
+                opt.zero_grad()
+            losses.append(loss.item() * ACCUMULATION_STEPS)
             
         model.eval()
         val_losses = []
         with torch.no_grad():
-            for x1, x2, target in val_dl:
-                x1, x2, target = x1.to(DEVICE), x2.to(DEVICE), target.to(DEVICE)
-                val_losses.append(crit(model(x1, x2), target).item())
+            for x1, x2, y in val_dl:
+                val_losses.append(crit(model(x1.to(DEVICE), x2.to(DEVICE)), y.to(DEVICE)).item())
         
         avg_v = np.mean(val_losses)
         print(f"   Ep {ep+1}: Train={np.mean(losses):.4f} | Val={avg_v:.4f}")
+        if avg_v < best_v: best_v = avg_v
         
-        if avg_v < best_val: best_val = avg_v
-        
-        # Refresh Data
         train_dl.dataset.generate_epoch_pairs()
         val_dl.dataset.generate_epoch_pairs()
-        
-    return best_val
+    return best_v
 
 def main():
     manager = DataManager(DATA_ROOT, GTF_PATH)
     all_indices = list(range(len(manager.genes)))
     
-    print("\n" + "="*40)
-    print("[MODEL A] Original | Fixed 80/20 Split")
-    print("="*40)
+    # --- MODEL A ---
+    print("\n" + "="*50)
+    print(f"[MODEL A] Paper Copy: {SEQ_LEN_A}bp | MSE | Unfrozen")
+    print("="*50)
+    t_idx, v_idx = train_test_split(all_indices, test_size=0.2, random_state=42)
+    ds_train = manager.get_dataset(t_idx, True, SEQ_LEN_A)
+    ds_val = manager.get_dataset(v_idx, False, SEQ_LEN_A)
     
-    train_idx, val_idx = train_test_split(all_indices, test_size=0.2, random_state=42)
-    ds_train = manager.get_dataset(train_idx, is_train=True)
-    ds_val = manager.get_dataset(val_idx, is_train=False)
-    
-    model_a = EnformerRobust(mode="Original").to(DEVICE)
-    score_a = train_cycle(model_a, DataLoader(ds_train, batch_size=1, shuffle=True), 
-                          DataLoader(ds_val, batch_size=1), epochs=MAX_EPOCHS)
-    print(f"Model A Score: {score_a:.5f}")
+    model_a = EnformerWrapper(mode="Original").to(DEVICE)
+    score_a = train_cycle(model_a, 
+                          DataLoader(ds_train, batch_size=1, shuffle=True), 
+                          DataLoader(ds_val, batch_size=1), 
+                          MAX_EPOCHS, "Original")
+    print(f"Model A Final Score (MSE): {score_a:.5f}")
 
-    print("\n" + "="*40)
-    print("[MODEL B] SwiGLU | 5-Fold Cross Validation")
-    print("="*40)
-    
-    kfold = KFold(n_splits=5, shuffle=True, random_state=42)
+    # --- MODEL B ---
+    print("\n" + "="*50)
+    print(f"[MODEL B] Enhanced: {SEQ_LEN_B}bp | SwiGLU | Huber")
+    print("="*50)
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
     fold_scores = []
     
-    for fold, (train_idx, val_idx) in enumerate(kfold.split(all_indices)):
-        print(f"   >>> Running Fold {fold+1}/5...")
-        ds_train = manager.get_dataset(train_idx, is_train=True)
-        ds_val = manager.get_dataset(val_idx, is_train=False)
+    for fold, (ti, vi) in enumerate(kf.split(all_indices)):
+        print(f"   >>> Fold {fold+1}/5...")
+        ds_train = manager.get_dataset(ti, True, SEQ_LEN_B) 
+        ds_val = manager.get_dataset(vi, False, SEQ_LEN_B)
         
-        model_b = EnformerRobust(mode="SwiGLU").to(DEVICE)
-        score = train_cycle(model_b, DataLoader(ds_train, batch_size=1, shuffle=True), 
-                            DataLoader(ds_val, batch_size=1), epochs=MAX_EPOCHS)
+        model_b = EnformerWrapper(mode="SwiGLU").to(DEVICE)
+        score = train_cycle(model_b, 
+                            DataLoader(ds_train, batch_size=1, shuffle=True), 
+                            DataLoader(ds_val, batch_size=1), 
+                            MAX_EPOCHS, "SwiGLU")
         fold_scores.append(score)
-        print(f"       Fold {fold+1} Score: {score:.5f}")
-        
-    score_b = np.mean(fold_scores)
+        print(f"       Fold Score: {score:.5f}")
     
-    print("\n" + "#"*40)
-    print(" FINAL RESULTS (Huber Loss)")
-    print("#"*40)
-    print(f"Model A (Original, Fixed): {score_a:.5f}")
-    print(f"Model B (SwiGLU, 5-Fold):  {score_b:.5f}")
-    
-    if score_b < score_a:
-        print("WINNER: Model B (SwiGLU)")
-    else:
-        print("WINNER: Model A (Original)")
+    print(f"\nFINAL SUMMARY:\nModel A (MSE): {score_a:.5f}\nModel B (Huber): {np.mean(fold_scores):.5f}")
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
 EOF
 
-echo ">>> Launching Final Robust Training..."
-nohup "$PYTHON_EXEC" -u train_paper_robust.py > final_results.log 2>&1 &
-echo ">>> RUNNING. Track progress with:"
-echo "    tail -f final_results.log"
+echo ">>> Launching FINAL MASTER TRAINING..."
+nohup "$PYTHON_EXEC" -u train_compliance_final.py > compliance_results.log 2>&1 &
+echo ">>> RUNNING. Track progress:"
+echo "    tail -f compliance_results.log"
