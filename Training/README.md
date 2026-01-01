@@ -1,64 +1,93 @@
 The final models A & B were trained using complete pre processed Geuvadis Dataset. We used Huber loss for comparison among these 2 models and as expected model B performed better when trained on the complete dataset.
 
 The final output of the script provided is as follows:
-
+>>> OFFICIAL ARCHITECTURE REPLICATION | Device: cuda
 >>> Loading Data Manager...
-   Samples: 455
-   Caching Expression...
-   Parsing Genes & Calculating Stats...
-   Valid Genes: 5335
+   Indexed 455 valid samples.
+   Caching Expression Data...
+   Parsing GTF...
+   Calculating Whole-Population Z-Scores...
+   Final Valid Genes: 200116
 
-========================================
-[MODEL A] Original | Fixed 80/20 Split
-========================================
-   Ep 1: Train=605.7739 | Val=369.1155
-   Ep 2: Train=677.7202 | Val=544.2952
-   Ep 3: Train=400.6927 | Val=415.1619
-   Ep 4: Train=365.5516 | Val=373.8269
-   Ep 5: Train=495.2819 | Val=603.7257
-   Ep 6: Train=558.8458 | Val=118.3083
-   Ep 7: Train=699.0281 | Val=330.4861
-   Ep 8: Train=403.7441 | Val=339.8810
-   Ep 9: Train=400.9455 | Val=419.4319
-   Ep 10: Train=658.3527 | Val=1061.5912
-Model A Score: 118.30830
+==================================================
+[MODEL A] Paper Copy: 49152bp | MSE | Unfrozen
+==================================================
+   Ep 1: Train=2.0784 | Val=1.9613
+   Ep 2: Train=1.9569 | Val=1.8410
+   Ep 3: Train=1.9322 | Val=2.0030
+   Ep 4: Train=1.8443 | Val=1.9818
+   Ep 5: Train=1.8711 | Val=2.0158
+   Ep 6: Train=1.9904 | Val=1.7292
+   Ep 7: Train=1.9733 | Val=1.8226
+   Ep 8: Train=1.9135 | Val=1.9579
+   Ep 9: Train=1.9187 | Val=2.0300
+   Ep 10: Train=1.9039 | Val=1.8305
+Model A Final Score (MSE): 1.72921
 
-========================================
-[MODEL B] SwiGLU | 5-Fold Cross Validation
-========================================
-   >>> Running Fold 1/5...
-   Ep 1: Train=349.3034 | Val=1303.1471
-   Ep 2: Train=483.7309 | Val=127.5899
-   Ep 3: Train=529.0118 | Val=350.9505
-   Ep 4: Train=374.6188 | Val=744.5565
-   Ep 5: Train=481.0391 | Val=308.6046
-   Ep 6: Train=622.2447 | Val=1156.0350
-   Ep 7: Train=455.7476 | Val=235.8017
-   Ep 8: Train=455.6249 | Val=1179.0845
-   Ep 9: Train=370.5511 | Val=507.7365
-   Ep 10: Train=331.0943 | Val=1011.8687
-       Fold 1 Score: 127.58992
-   >>> Running Fold 2/5...
-   Ep 1: Train=610.1194 | Val=713.1568
-Model A Score: 51.75326
+==================================================
+[MODEL B] Enhanced: 196608bp | SwiGLU | Huber
+==================================================
+   >>> Fold 1/5...
+   Ep 1: Train=0.5263 | Val=0.4729
+   Ep 2: Train=0.4955 | Val=0.4958
+   Ep 3: Train=0.5099 | Val=0.4921
+   Ep 4: Train=0.5053 | Val=0.4781
+   Ep 5: Train=0.5145 | Val=0.5084
+   Ep 6: Train=0.5059 | Val=0.5089
+   Ep 7: Train=0.5059 | Val=0.5075
+   Ep 8: Train=0.4940 | Val=0.5077
+   Ep 9: Train=0.5029 | Val=0.4622
+   Ep 10: Train=0.5111 | Val=0.4778
+       Fold Score: 0.46217
+   >>> Fold 2/5...
+   Ep 1: Train=0.5109 | Val=0.5021
+   Ep 2: Train=0.4993 | Val=0.4780
+   Ep 3: Train=0.5023 | Val=0.4935
+   Ep 4: Train=0.5060 | Val=0.5227
+   Ep 5: Train=0.5090 | Val=0.4985
+   Ep 6: Train=0.5104 | Val=0.5135
+   Ep 7: Train=0.4987 | Val=0.4935
+   Ep 8: Train=0.5067 | Val=0.5126
+   Ep 9: Train=0.4960 | Val=0.4960
+   Ep 10: Train=0.4961 | Val=0.5053
+       Fold Score: 0.47802
+   >>> Fold 3/5...
+   Ep 1: Train=0.5047 | Val=0.4951
+   Ep 2: Train=0.4974 | Val=0.4979
+   Ep 3: Train=0.5192 | Val=0.5352
+   Ep 4: Train=0.5098 | Val=0.5075
+   Ep 5: Train=0.5034 | Val=0.5110
+   Ep 6: Train=0.5097 | Val=0.4883
+   Ep 7: Train=0.5014 | Val=0.4865
+   Ep 8: Train=0.4898 | Val=0.5308
+   Ep 9: Train=0.5112 | Val=0.4855
+   Ep 10: Train=0.5004 | Val=0.5346
+       Fold Score: 0.48549
+   >>> Fold 4/5...
+   Ep 1: Train=0.5176 | Val=0.5332
+   Ep 2: Train=0.5017 | Val=0.4971
+   Ep 3: Train=0.5005 | Val=0.4996
+   Ep 4: Train=0.5014 | Val=0.5048
+   Ep 5: Train=0.5078 | Val=0.5145
+   Ep 6: Train=0.5057 | Val=0.5137
+   Ep 7: Train=0.4972 | Val=0.4829
+   Ep 8: Train=0.5149 | Val=0.5105
+   Ep 9: Train=0.4945 | Val=0.4974
+   Ep 10: Train=0.5011 | Val=0.5229
+       Fold Score: 0.48293
+   >>> Fold 5/5...
+   Ep 1: Train=0.5104 | Val=0.4963
+   Ep 2: Train=0.5065 | Val=0.5035
+   Ep 3: Train=0.5087 | Val=0.5029
+   Ep 4: Train=0.5026 | Val=0.5326
+   Ep 5: Train=0.5031 | Val=0.5143
+   Ep 6: Train=0.5070 | Val=0.5132
+   Ep 7: Train=0.5029 | Val=0.5095
+   Ep 8: Train=0.5041 | Val=0.5053
+   Ep 9: Train=0.5001 | Val=0.5065
+   Ep 10: Train=0.4915 | Val=0.5051
+       Fold Score: 0.49627
 
-========================================
-[MODEL B] SwiGLU | 5-Fold Cross Validation
-========================================
-   >>> Running Fold 1/5...
-       Fold 1 Score: 26.78385
-   >>> Running Fold 2/5...
-       Fold 2 Score: 0.50178
-   >>> Running Fold 3/5...
-       Fold 3 Score: 34.68949
-   >>> Running Fold 4/5...
-       Fold 4 Score: 0.45485
-   >>> Running Fold 5/5...
-       Fold 5 Score: 0.50647
-
-########################################
- FINAL RESULTS (Huber Loss)
-########################################
-Model A (Original, Fixed): 51.75326
-Model B (SwiGLU, 5-Fold):  12.58729
-WINNER: Model B (SwiGLU)
+FINAL SUMMARY:
+Model A (MSE): 1.72921
+Model B (Huber): 0.48097
